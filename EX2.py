@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu May 23 19:11:54 2024
+Created on Tue May 28 19:07:59 2024
 
 @author: USER
 """
 
-data=list()
-for i in range(1,11):
-    data.append(i)
-print(data)
-
-
-level=[i for i in range(1,11)]#串列表達式
-print(level)
-
-number=[i for i in range(1,11) if i % 3 ==0]
-print(number)
+student=("John","Mary",96,100,61)
+name,sex,*score=student
+print("姓名:",name)
+print("性別:",sex)
+print("分數:",score)
+height=165,172,181
+print(height)

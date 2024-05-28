@@ -1,16 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu May 23 21:11:14 2024
+Created on Tue May 28 20:12:57 2024
 
 @author: USER
 """
 
-def area(w,h):
-    return w*h
-def loopfor(start,end):
-    total=0
-    for i in range(start,end+1):
-        total +=i
-        return total
-print(area(3, 4))
-print(loopfor(2,30))
+def student(school,**personal):
+    print(school,"依學生姓名排序")
+    
+    for key in sorted(personal):
+        print('%-10s%d' % (key,personal[key]))
+        
+        
+    print("-" * 30)
+    
+    print("及格資訊如下")
+    up60 = {k:v for k,v in personal.items() if v >=60}
+    c=len(up60)
+    
+    print('人數:',c,'人')
+    print(up60)
+
+student('中一中', Mary=90,Sue=81,Bill=39,John=61,Eric=42,Tom=72)

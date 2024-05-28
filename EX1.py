@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu May 23 18:58:46 2024
+Spyder Editor
 
-@author: USER
+This is a temporary script file.
 """
 
-fruits={'apple':69,'orange':28}
-fruits.setdefault('banan',30)
-print(fruits)
-fruits.setdefault('cherray')
-print(fruits)
-fruits.setdefault('apple',100)
-print(fruits)
+
+def factorial(data,start):
+    result=start
+    for item in data:
+        result *= item
+    return result
+res=factorial(data=[3,5,7,9,11],start=1)
+print("結果:{:,}".format(res))

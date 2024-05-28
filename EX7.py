@@ -1,14 +1,15 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu May 23 21:24:59 2024
-
-@author: USER
-"""
-
-def circle(r=10):
+def circle(r=5):
+    print('半徑:',r)
     area = r*r*3.14
-    circleLen=2*r*3.14
-    return area,circleLen
-a,c=circle()
-ac=circle(5)
-print(ac)
+    print('圓面積:',area)
+circle()
+circle(11)
+
+def city(number,name='台中',parent='市民'):
+    #函式裡面有預設值後面都要是預設值
+    print(number)
+    print(name)
+    print(parent)
+city(400)
+city(700,'高雄')
+city(900,'台東','原住民')
