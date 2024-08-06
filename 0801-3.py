@@ -40,3 +40,9 @@ if __name__ == '__main__':
     f=io.StringIO(data)
     parser.parse(f)
     
+    data = requests.get(url).text
+fileName="bike.xml"
+with open (fileName,'w',encoding="utf-8") as fObj:
+           fObj.write(data)
+parser.parse(fileName)
+    
