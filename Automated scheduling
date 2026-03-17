@@ -1,0 +1,647 @@
+import sys
+import os
+import re
+import json
+import time
+import pandas as pd
+import googlemaps
+from datetime import datetime, timedelta
+
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                               QHBoxLayout, QLabel, QLineEdit, QPushButton, 
+                               QTextEdit, QComboBox, QCheckBox, QGroupBox, 
+                               QFormLayout, QMessageBox, QTableWidget, 
+                               QTableWidgetItem, QHeaderView, QAbstractItemView, QFileDialog, QSplitter)
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont, QColor
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+
+# ==========================================
+# ⚙️ 設定檔管理系統 (Config Manager)
+# ==========================================
+CONFIG_FILE = "config.json"
+
+DEFAULT_CONFIG = {
+    "api_key": "YOUR_GOOGLE_MAPS_API_KEY_HERE",
+    "excel_path": "11月名單.xlsx",
+    "login_url": "https://luna.compal-health.com/login",
+    "caregivers": {
+        "林榆臻":"女", "林淑芬":"女", "陳鴻輝":"男", "林穱":"男", "趙子鈞": "男",
+        "廖月雲":"女", "黃乙宸":"男", "田雪花":"女", "錢莉花":"女", "司月娥":"女",
+        "柯玉春":"女", "曾之琪":"女", "王姿懿":"女", "林孟樺":"女", "阮家珍":"女",
+        "楊秉琪":"男", "林敬桓":"男" 
+    },
+    "algorithm": {
+        "max_shift_limit": 90,
+        "min_travel_buffer": 5,
+        "day_start": "08:00",
+        "day_end": "18:00"
+    }
+}
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=4)
+        return DEFAULT_CONFIG
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"讀取設定檔失敗，使用預設值: {e}")
+        return DEFAULT_CONFIG
+
+# 載入全域設定
+CFG = load_config()
+API_KEY = CFG['api_key']
+CAREGIVER_GENDERS = CFG['caregivers']
+MAX_SHIFT_LIMIT = CFG['algorithm']['max_shift_limit']
+MIN_TRAVEL_BUFFER = CFG['algorithm']['min_travel_buffer']
+DAY_START_HOUR = CFG['algorithm']['day_start']
+DAY_END_HOUR = CFG['algorithm']['day_end']
+
+# 初始化 Google Maps
+try:
+    gmaps = googlemaps.Client(key=API_KEY)
+except Exception as e:
+    gmaps = None
+
+# ==========================================
+# 🎨 黑化主題樣式表 (高對比修正版)
+# ==========================================
+DARK_STYLESHEET = """
+QWidget { background-color: #2b2b2b; color: #ffffff; font-family: "Microsoft JhengHei", sans-serif; font-size: 11pt; }
+
+/* 輸入框與選單：增加邊框亮度，讓它更明顯 */
+QLineEdit, QComboBox, QSpinBox { 
+    background-color: #3c3f41; 
+    border: 1px solid #aaaaaa; /* 邊框變亮灰 */
+    border-radius: 4px; 
+    padding: 6px; 
+    color: #ffffff; 
+}
+QLineEdit:focus, QComboBox:focus { border: 2px solid #00aaff; }
+
+/* 按鈕：保持立體感 */
+QPushButton { 
+    background-color: #454545; 
+    border: 1px solid #888; 
+    border-radius: 4px; 
+    padding: 8px 15px; 
+    font-weight: bold; 
+}
+QPushButton:hover { background-color: #555; border-color: #00aaff; }
+QPushButton:pressed { background-color: #0078d4; }
+QPushButton:disabled { background-color: #333; color: #777; border-color: #444; }
+
+/* 群組框：標題更亮 */
+QGroupBox { 
+    border: 1px solid #666; 
+    border-radius: 6px; 
+    margin-top: 12px; 
+    padding-top: 12px; 
+    font-weight: bold; 
+}
+QGroupBox::title { 
+    subcontrol-origin: margin; 
+    subcontrol-position: top left; 
+    left: 10px; 
+    color: #00aaff; /* 標題亮藍色 */
+    background-color: #2b2b2b; /* 避免文字被邊框線穿過 */
+    padding: 0 5px;
+}
+
+/* 🔥 修正重點：高對比勾選框 (CheckBox) */
+QCheckBox { 
+    spacing: 8px; 
+    color: #ffffff; 
+    font-weight: bold;
+}
+QCheckBox::indicator { 
+    width: 22px; 
+    height: 22px; 
+    background-color: #111111; /*以此深黑底襯托白框*/
+    border: 2px solid #ffffff; /* 純白邊框，超明顯 */
+    border-radius: 4px; 
+}
+QCheckBox::indicator:hover { 
+    border: 2px solid #00aaff; /* 滑鼠移過去變藍框 */
+    background-color: #333333;
+}
+QCheckBox::indicator:checked { 
+    background-color: #00aaff; /* 勾選後變實心亮藍 */
+    border: 2px solid #00aaff; 
+}
+
+/* 表格優化 */
+QTableWidget { background-color: #333; gridline-color: #555; border: 1px solid #666; }
+QHeaderView::section { background-color: #444; color: #fff; padding: 6px; border: 1px solid #555; font-weight: bold; }
+QScrollBar:vertical { background: #2b2b2b; width: 12px; }
+QScrollBar::handle:vertical { background: #666; border-radius: 6px; }
+"""
+# ==========================================
+# 🧠 核心邏輯工具函式
+# ==========================================
+def get_travel_time(origin, destination):
+    if not gmaps: return 30 # 無 API Key 時的 Fallback
+    if not origin or not destination: return 0
+    if origin == destination: return 0
+    try:
+        matrix = gmaps.distance_matrix(origin, destination, mode='driving', language='zh-TW')
+        if matrix['rows'][0]['elements'][0]['status'] != 'OK': return 999
+        seconds = matrix['rows'][0]['elements'][0]['duration']['value']
+        return int(seconds / 60)
+    except: return 30 
+
+def parse_time_range(time_str):
+    try:
+        today = datetime.now().date()
+        clean_time = time_str.split(' ')[0]
+        start_str, end_str = clean_time.split('-')
+        return datetime.strptime(f"{today} {start_str}", "%Y-%m-%d %H:%M"), datetime.strptime(f"{today} {end_str}", "%Y-%m-%d %H:%M")
+    except: return None, None
+
+def get_day_boundaries():
+    today = datetime.now().date()
+    return datetime.strptime(f"{today} {DAY_START_HOUR}", "%Y-%m-%d %H:%M"), datetime.strptime(f"{today} {DAY_END_HOUR}", "%Y-%m-%d %H:%M")
+
+def get_caregiver_gender(raw_name):
+    for name_key, gender in CAREGIVER_GENDERS.items():
+        if name_key in raw_name: return gender
+    return "未知"
+
+def calculate_chain_slack(check_list, current_idx, direction):
+    total_slack = 0
+    if direction == 'left':
+        for k in range(current_idx - 1, -1, -1):
+            this_job = check_list[k]; next_job = check_list[k+1]
+            _, this_end = parse_time_range(this_job['time'])
+            next_start, _ = parse_time_range(next_job['time'])
+            gap = (next_start - this_end).total_seconds() / 60
+            if this_job['case_name'] == "上班": total_slack += gap; break
+            else: total_slack += max(0, gap - MIN_TRAVEL_BUFFER)
+    elif direction == 'right':
+        for k in range(current_idx + 1, len(check_list) - 1):
+            this_job = check_list[k]; next_job = check_list[k+1]
+            _, this_end = parse_time_range(this_job['time'])
+            next_start, _ = parse_time_range(next_job['time'])
+            gap = (next_start - this_end).total_seconds() / 60
+            if next_job['case_name'] == "下班": total_slack += gap; break
+            else: total_slack += max(0, gap - MIN_TRAVEL_BUFFER)
+    return total_slack
+
+def check_reassignment_possibility(conflicting_job, original_caregiver, day_schedules, day_name):
+    suggestions = []
+    job_start, job_end = parse_time_range(conflicting_job['time'])
+    job_duration = (job_end - job_start).total_seconds() / 60
+    job_addr = conflicting_job['address']
+    for candidate, schedule in day_schedules.items():
+        if candidate == original_caregiver: continue
+        check_list = []
+        check_list.append({"time": f"{DAY_START_HOUR}-{DAY_START_HOUR}", "address": None, "case_name": "上班"})
+        check_list.extend(schedule)
+        check_list.append({"time": f"{DAY_END_HOUR}-{DAY_END_HOUR}", "address": None, "case_name": "下班"})
+        for i in range(len(check_list) - 1):
+            prev = check_list[i]; next_j = check_list[i+1]
+            _, prev_end = parse_time_range(prev['time'])
+            next_start, _ = parse_time_range(next_j['time'])
+            gap = (next_start - prev_end).total_seconds() / 60
+            t1 = get_travel_time(prev['address'], job_addr) if prev['address'] else 0
+            t2 = get_travel_time(job_addr, next_j['address']) if next_j['address'] else 0
+            total_needed = t1 + job_duration + t2 + 15
+            if gap >= total_needed:
+                arrival = prev_end + timedelta(minutes=t1)
+                if arrival <= job_start:
+                    finish = job_start + timedelta(minutes=job_duration)
+                    arrive_next = finish + timedelta(minutes=t2 + 15)
+                    if arrive_next <= next_start:
+                        suggestions.append(candidate); break
+    return suggestions
+
+def simulate_push_right(check_list, start_idx, push_minutes):
+    impacted_details = []
+    current_delay = push_minutes
+    for k in range(start_idx, len(check_list) - 1): 
+        this_job = check_list[k]
+        next_job = check_list[k+1]
+        if this_job['case_name'] == "下班": break
+        orig_start, orig_end = parse_time_range(this_job['time'])
+        new_start = orig_start + timedelta(minutes=current_delay)
+        new_end = orig_end + timedelta(minutes=current_delay)
+        impacted_details.append(f"【{this_job['case_name']}】順延至 {new_start.strftime('%H:%M')}")
+        
+        if next_job['case_name'] == "下班":
+            day_end_limit = get_day_boundaries()[1]
+            if new_end > day_end_limit: return False, "超過下班時間", 0
+            else: return True, "、".join(impacted_details), current_delay
+        else:
+            next_orig_start, _ = parse_time_range(next_job['time'])
+            t_travel = get_travel_time(this_job['address'], next_job['address'])
+            arrive_next = new_end + timedelta(minutes=t_travel + MIN_TRAVEL_BUFFER)
+            if arrive_next > next_orig_start:
+                added_delay = (arrive_next - next_orig_start).total_seconds() / 60
+                current_delay = added_delay 
+                if current_delay > MAX_SHIFT_LIMIT: return False, f"延遲擴大至 {int(current_delay)} 分鐘", 0
+            else: return True, "、".join(impacted_details), push_minutes
+    return True, "、".join(impacted_details), push_minutes
+
+# ==========================================
+# 🧵 後台計算執行緒
+# ==========================================
+class CalculationThread(QThread):
+    log_signal = Signal(str)
+    result_signal = Signal(list)
+    finished_signal = Signal()
+
+    def __init__(self, input_data, driver):
+        super().__init__()
+        self.data = input_data
+        self.driver = driver
+
+    def run(self):
+        self.log_signal.emit(f"📂 正在載入 Excel 資料庫: {CFG['excel_path']}...")
+        if not gmaps: self.log_signal.emit(f"⚠️ 警告: 未偵測到有效的 API Key，路程計算將使用預設值。")
+        
+        try:
+            df = pd.read_excel(CFG['excel_path'], usecols="G,AW", engine='openpyxl')
+            address_db = {str(name).strip(): str(addr).strip() for name, addr in zip(df.iloc[:, 0], df.iloc[:, 1])}
+            self.log_signal.emit(f"✅ 地址庫載入完成，共 {len(address_db)} 筆。")
+        except Exception as e:
+            self.log_signal.emit(f"❌ Excel 讀取失敗: {e}")
+            return
+
+        final_results_storage = []
+        try:
+            target_days = self.data['days']
+            target_gender = self.data['gender']
+            required_segments = self.data['segments']
+            case_address = self.data['address']
+
+            for day_idx in target_days:
+                week_map = {1:"週一", 2:"週二", 3:"週三", 4:"週四", 5:"週五", 6:"週六", 7:"週日"}
+                day_name = week_map.get(day_idx, f"週{day_idx}")
+                self.log_signal.emit(f"\n🔎 掃描中: [{day_name}]")
+
+                day_to_col_map = {1: 3, 2: 4, 3: 5, 4: 6, 5: 7, 6: 8, 7: 2}
+                column_index = day_to_col_map.get(day_idx, 3) 
+                
+                rows = self.driver.find_elements(By.XPATH, '//*[@id="page-wrapper"]//table/tbody/tr')
+                XPATH_TARGET_COL_CARDS = f"./td[{column_index}]//div[contains(@class, 'CalendarCard')]"
+
+                caregiver_schedules = {}
+
+                for row in rows:
+                    try:
+                        try: raw_caregiver_name = row.find_element(By.XPATH, "./td[1]//a").text.strip()
+                        except: continue
+                        if not raw_caregiver_name: continue
+                        
+                        cg_name = None
+                        for db_name in CAREGIVER_GENDERS.keys():
+                            if db_name in raw_caregiver_name: cg_name = db_name; break
+                        if not cg_name: continue 
+
+                        cards = row.find_elements(By.XPATH, XPATH_TARGET_COL_CARDS)
+                        personal_schedule = [] 
+                        is_off = False 
+
+                        for card in cards:
+                            if not card.is_displayed(): continue
+                            text = card.text.strip()
+                            if "請假 (無代)" in text: continue
+                            if "特休" in text or "病假" in text or "事假" in text: is_off = True; break
+                            if not re.search(r"\d{1,2}:\d{2}", text): continue
+                            
+                            found_time_str = ""
+                            for line in text.split('\n'):
+                                if ":" in line and "-" in line: found_time_str = line; break
+                            
+                            found_cn = "未知"; found_addr = None
+                            for db_n in address_db:
+                                if db_n in text: found_cn = db_n; found_addr = address_db[db_n]; break
+                            
+                            if found_time_str:
+                                personal_schedule.append({ "case_name": found_cn, "address": found_addr, "time": found_time_str })
+                        
+                        if not is_off: caregiver_schedules[cg_name] = personal_schedule
+                    except: continue
+
+                self.log_signal.emit(f"   -> 取得 {len(caregiver_schedules)} 位居服員班表")
+
+                # --- 演算法開始 ---
+                for segment in required_segments:
+                    seg_name = segment['name']
+                    req_time_str = segment['time']
+                    duration = segment['duration']
+                    req_start_time = datetime.strptime(f"{datetime.now().date()} {req_time_str}", "%Y-%m-%d %H:%M") if req_time_str else None
+
+                    for caregiver, schedule in caregiver_schedules.items():
+                        if target_gender:
+                            if get_caregiver_gender(caregiver) != target_gender: continue 
+
+                        schedule.sort(key=lambda x: parse_time_range(x['time'])[0] or datetime.max)
+                        
+                        # 空班表處理
+                        if not schedule:
+                            final_results_storage.append({
+                                "day": day_name, "segment": seg_name, "caregiver": caregiver, "type": "完美 (全天空檔)",
+                                "detail": "全日無行程。", "sort_score": 1
+                            })
+                            continue
+
+                        # 建立檢查鏈
+                        check_list = [{"time": f"{DAY_START_HOUR}-{DAY_START_HOUR}", "address": None, "case_name": "上班"}]
+                        check_list.extend(schedule)
+                        check_list.append({"time": f"{DAY_END_HOUR}-{DAY_END_HOUR}", "address": None, "case_name": "下班"})
+
+                        # 轉派邏輯
+                        if req_start_time:
+                            for job in schedule:
+                                j_start, j_end = parse_time_range(job['time'])
+                                req_end = req_start_time + timedelta(minutes=duration)
+                                if max(j_start, req_start_time) < min(j_end, req_end):
+                                    replacements = check_reassignment_possibility(job, caregiver, caregiver_schedules, day_name)
+                                    if replacements:
+                                        msg = f"建議將【{job['case_name']}】轉給 {replacements[0]}，空出時段。"
+                                        final_results_storage.append({"day": day_name, "segment": seg_name, "caregiver": caregiver, "type": "🔴 轉派策略", "detail": msg, "sort_score": 3})
+
+                        # 空檔檢查邏輯
+                        for i in range(len(check_list) - 1):
+                            prev = check_list[i]; next_j = check_list[i+1]
+                            p_start, p_end = parse_time_range(prev['time'])
+                            n_start, _ = parse_time_range(next_j['time'])
+                            
+                            if req_start_time and n_start < req_start_time: continue
+
+                            t1 = get_travel_time(prev['address'], case_address) if prev['address'] else 0
+                            t2 = get_travel_time(case_address, next_j['address']) if next_j['address'] else 0
+                            earliest_arrival = p_end + timedelta(minutes=t1)
+                            
+                            # 指定時間模式
+                            if req_start_time:
+                                if earliest_arrival <= req_start_time:
+                                    # 檢查是否撞後面
+                                    req_end = req_start_time + timedelta(minutes=duration)
+                                    arrive_next = req_end + timedelta(minutes=t2 + MIN_TRAVEL_BUFFER)
+                                    
+                                    if arrive_next <= n_start:
+                                        msg = f"可於 {prev['case_name']} 後準時抵達。"
+                                        final_results_storage.append({"day": day_name, "segment": seg_name, "caregiver": caregiver, "type": "✅ 完美時段", "detail": msg, "sort_score": 1})
+                                    else:
+                                        # 撞後面 -> 骨牌順延
+                                        overlap = int((arrive_next - n_start).total_seconds() / 60)
+                                        if overlap <= MAX_SHIFT_LIMIT:
+                                            ok, impact_str, _ = simulate_push_right(check_list, i+1, overlap)
+                                            if ok:
+                                                final_results_storage.append({"day": day_name, "segment": seg_name, "caregiver": caregiver, "type": "🟠 連鎖挪移", "detail": f"需將後續行程順延：{impact_str}", "sort_score": 2})
+
+                                else:
+                                    # 遲到 -> 挪前案
+                                    diff = int((earliest_arrival - req_start_time).total_seconds() / 60)
+                                    # 簡單檢查前案空檔 (簡化版)
+                                    if i > 0:
+                                        _, pp_end = parse_time_range(check_list[i-1]['time'])
+                                        p_start_real, _ = parse_time_range(prev['time'])
+                                        if (p_start_real - pp_end).total_seconds()/60 > (diff + 15):
+                                            final_results_storage.append({"day": day_name, "segment": seg_name, "caregiver": caregiver, "type": "🟡 挪移前案", "detail": f"請前案 {prev['case_name']} 提早 {diff} 分結束即可。", "sort_score": 2})
+
+                            # 彈性模式
+                            elif not req_start_time:
+                                total_need = t1 + duration + t2 + MIN_TRAVEL_BUFFER
+                                gap = (n_start - p_end).total_seconds() / 60
+                                if gap >= total_need:
+                                    suggest_start = earliest_arrival + timedelta(minutes=5)
+                                    suggest_end = suggest_start + timedelta(minutes=duration)
+                                    final_results_storage.append({"day": day_name, "segment": seg_name, "caregiver": caregiver, "type": "✅ 彈性安插", "detail": f"建議 {suggest_start.strftime('%H:%M')}~{suggest_end.strftime('%H:%M')}", "sort_score": 1})
+
+        except Exception as e:
+            self.log_signal.emit(f"❌ 運算發生錯誤: {str(e)}")
+        
+        finally:
+            self.driver.quit()
+            self.result_signal.emit(final_results_storage)
+            self.finished_signal.emit()
+
+# ==========================================
+# 🖥️ 主視窗介面
+# ==========================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"居服員智慧排班系統 V2.0 (Pro版) - {CFG['excel_path']}")
+        self.setGeometry(50, 50, 1280, 850)
+        self.results_data = [] # 儲存結果以供匯出
+        self.setup_ui()
+        self.log("🚀 系統啟動就緒。設定檔已載入。")
+        if not gmaps: self.log("⚠️ 注意: 未設定 Google API Key，路程計算將不準確。")
+
+    def setup_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+
+        # 左側控制區 (Splitter Left)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # 1. 基本資料
+        form_group = QGroupBox("📝 個案資料與限制")
+        form_layout = QFormLayout()
+        self.name_input = QLineEdit()
+        self.addr_input = QLineEdit()
+        form_layout.addRow("個案姓名:", self.name_input)
+        form_layout.addRow("個案地址:", self.addr_input)
+        
+        self.gender_combo = QComboBox()
+        self.gender_combo.addItems(["不拘", "限女性", "限男性"])
+        form_layout.addRow("性別限制:", self.gender_combo)
+        
+        self.general_duration = QComboBox()
+        for d in [30, 60, 90, 120, 180]: self.general_duration.addItem(f"{d} 分鐘", d)
+        self.general_duration.setCurrentIndex(1)
+        form_layout.addRow("預設時長:", self.general_duration)
+        
+        days_layout = QHBoxLayout()
+        self.day_checks = []
+        for i, d in enumerate(["一","二","三","四","五","六","日"], 1):
+            cb = QCheckBox(d)
+            if i in [1,3,5]: cb.setChecked(True)
+            self.day_checks.append((i, cb))
+            days_layout.addWidget(cb)
+        form_layout.addRow("排班日:", days_layout)
+        form_group.setLayout(form_layout)
+        left_layout.addWidget(form_group)
+
+        # 2. 指定時段
+        seg_group = QGroupBox("⏰ 指定時段 (可選)")
+        seg_layout = QVBoxLayout()
+        self.segments_ui = []
+        times = [f"{h:02d}:{m:02d}" for h in range(7, 20) for m in range(0, 60, 30)]
+        for label in ["早班", "中班", "晚班"]:
+            h_layout = QHBoxLayout()
+            cb = QCheckBox(label)
+            t_combo = QComboBox(); t_combo.addItems(times)
+            if label == "早班": t_combo.setCurrentText("09:00")
+            elif label == "中班": t_combo.setCurrentText("13:00")
+            else: t_combo.setCurrentText("17:00")
+            dur_combo = QComboBox()
+            for d in [30, 60, 90, 120]: dur_combo.addItem(f"{d}分", d)
+            dur_combo.setCurrentIndex(1)
+            
+            h_layout.addWidget(cb)
+            h_layout.addWidget(t_combo)
+            h_layout.addWidget(dur_combo)
+            seg_layout.addLayout(h_layout)
+            self.segments_ui.append({"cb":cb, "time":t_combo, "dur":dur_combo, "name":label})
+        seg_group.setLayout(seg_layout)
+        left_layout.addWidget(seg_group)
+
+        # 3. 按鈕區
+        btn_layout = QHBoxLayout()
+        self.run_btn = QPushButton("🚀 開始計算")
+        self.run_btn.setMinimumHeight(50)
+        self.run_btn.setStyleSheet("font-size: 14pt; background-color: #0078d4;")
+        self.run_btn.clicked.connect(self.start_calculation)
+        
+        self.export_btn = QPushButton("💾 匯出 Excel")
+        self.export_btn.setMinimumHeight(50)
+        self.export_btn.clicked.connect(self.export_excel)
+        self.export_btn.setEnabled(False)
+        
+        btn_layout.addWidget(self.run_btn)
+        btn_layout.addWidget(self.export_btn)
+        left_layout.addLayout(btn_layout)
+
+        # 右側結果與日誌 (Splitter Right)
+        right_splitter = QSplitter(Qt.Vertical)
+        
+        # 結果表格
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(5)
+        self.result_table.setHorizontalHeaderLabels(["日期", "時段", "居服員", "類型", "建議內容"])
+        self.result_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        right_splitter.addWidget(self.result_table)
+        
+        # 系統日誌
+        log_group = QGroupBox("📟 系統終端機 (System Log)")
+        log_layout = QVBoxLayout()
+        self.log_area = QTextEdit()
+        self.log_area.setReadOnly(True)
+        log_layout.addWidget(self.log_area)
+        log_group.setLayout(log_layout)
+        right_splitter.addWidget(log_group)
+
+        # 組合左右
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(right_splitter)
+        main_splitter.setStretchFactor(1, 2)
+        main_layout.addWidget(main_splitter)
+
+    def log(self, message):
+        t = datetime.now().strftime("%H:%M:%S")
+        self.log_area.append(f"[{t}] {message}")
+        self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
+
+    def start_calculation(self):
+        # 收集資料
+        target_days = [d for d, cb in self.day_checks if cb.isChecked()]
+        if not target_days: QMessageBox.warning(self, "錯誤", "請至少選擇一天！"); return
+        
+        segs = []
+        has_seg = False
+        for ui in self.segments_ui:
+            if ui["cb"].isChecked():
+                has_seg = True
+                segs.append({"name": ui["name"], "time": ui["time"].currentText(), "duration": ui["dur"].currentData()})
+        if not has_seg:
+            segs.append({"name": "彈性時段", "time": None, "duration": self.general_duration.currentData()})
+
+        input_data = {
+            "name": self.name_input.text(),
+            "address": self.addr_input.text(),
+            "gender": "女" if "女" in self.gender_combo.currentText() else "男" if "男" in self.gender_combo.currentText() else None,
+            "days": target_days,
+            "segments": segs
+        }
+
+        # 啟動流程
+        self.run_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self.result_table.setRowCount(0)
+        self.log("⏳ 正在啟動 Chrome 瀏覽器...")
+        
+        try:
+            options = webdriver.ChromeOptions()
+            # options.add_argument("--headless") # 若要背景執行可解開
+            self.driver = webdriver.Chrome(options=options)
+            self.driver.get(CFG['login_url'])
+            
+            msg = QMessageBox()
+            msg.setWindowTitle("登入等待")
+            msg.setText("請在瀏覽器完成登入並切換至【排班表】頁面。\n\n完成後點擊 OK。")
+            msg.setStyleSheet("background-color: #333; color: white;")
+            msg.exec()
+            
+            self.thread = CalculationThread(input_data, self.driver)
+            self.thread.log_signal.connect(self.log)
+            self.thread.result_signal.connect(self.show_results)
+            self.thread.finished_signal.connect(self.task_finished)
+            self.thread.start()
+            
+        except Exception as e:
+            self.log(f"❌ 啟動失敗: {e}")
+            self.run_btn.setEnabled(True)
+
+    def show_results(self, results):
+        self.results_data = results
+        if not results:
+            self.log("😭 未找到符合的時段。")
+            QMessageBox.information(self, "結果", "找不到符合條件的時段。")
+            return
+            
+        results.sort(key=lambda x: x['sort_score'])
+        self.result_table.setRowCount(len(results))
+        for i, item in enumerate(results):
+            self.result_table.setItem(i, 0, QTableWidgetItem(item['day']))
+            self.result_table.setItem(i, 1, QTableWidgetItem(item['segment']))
+            self.result_table.setItem(i, 2, QTableWidgetItem(item['caregiver']))
+            
+            type_item = QTableWidgetItem(item['type'])
+            if "完美" in item['type']: type_item.setForeground(QColor("#4caf50"))
+            elif "轉派" in item['type']: type_item.setForeground(QColor("#f44336"))
+            else: type_item.setForeground(QColor("#ff9800"))
+            type_item.setFont(QFont("Microsoft JhengHei", 9, QFont.Bold))
+            
+            self.result_table.setItem(i, 3, type_item)
+            self.result_table.setItem(i, 4, QTableWidgetItem(item['detail']))
+            
+        self.export_btn.setEnabled(True)
+        self.log(f"✅ 計算完成，共找到 {len(results)} 個方案。")
+
+    def export_excel(self):
+        if not self.results_data: return
+        path, _ = QFileDialog.getSaveFileName(self, "儲存檔案", "排班建議.xlsx", "Excel Files (*.xlsx)")
+        if path:
+            try:
+                df = pd.DataFrame(self.results_data)
+                # 清理不需要的欄位
+                if 'sort_score' in df.columns: del df['sort_score']
+                df.columns = ["日期", "時段", "居服員", "類型", "詳細建議"]
+                df.to_excel(path, index=False)
+                self.log(f"💾 檔案已儲存至: {path}")
+                os.startfile(path)
+            except Exception as e:
+                QMessageBox.critical(self, "錯誤", f"儲存失敗: {e}")
+
+    def task_finished(self):
+        self.run_btn.setEnabled(True)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyleSheet(DARK_STYLESHEET)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
