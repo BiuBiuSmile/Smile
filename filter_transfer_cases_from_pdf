@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""Filter transfer cases out of convenience-store payment PDF.
+
+Usage example:
+python filter_transfer_cases_from_pdf.py \
+  --input-pdf "payment_all_cases.pdf" \
+  --transfer-list "transfer_cases.csv" \
+  --name-column "name" \
+  --output-pdf "payment_without_transfer.pdf"
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+import shutil
+import threading
+from pathlib import Path
+from typing import Iterable
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter import ttk
+
+
+def _import_pdf_lib():
+    try:
+        from pypdf import PdfReader, PdfWriter  # type: ignore
+
+        return PdfReader, PdfWriter
+    except Exception:
+        from PyPDF2 import PdfReader, PdfWriter  # type: ignore
+
+        return PdfReader, PdfWriter
+
+
+def _normalize_text(value: str) -> str:
+    return "".join(value.split()).lower()
+
+
+def _read_txt_names(path: Path, encoding: str = "utf-8") -> set[str]:
+    tried_encodings = [encoding, "utf-8-sig", "cp950", "big5"]
+    last_exc: Exception | None = None
+    for enc in tried_encodings:
+        try:
+            names: set[str] = set()
+            with path.open("r", encoding=enc) as f:
+                for line in f:
+                    name = line.strip()
+                    if name:
+                        names.add(name)
+            return names
+        except UnicodeDecodeError as exc:
+            last_exc = exc
+            continue
+
+    if last_exc:
+        raise last_exc
+    return set()
+
+
+def _resolve_name_column(fieldnames: list[str], preferred: str | None = None) -> str:
+    candidates = []
+    if preferred and preferred.strip():
+        candidates.append(preferred.strip())
+    candidates.extend(["name", "姓名", "個案姓名", "案主姓名"])
+
+    exact_map = {name: name for name in fieldnames}
+    lower_map = {name.lower(): name for name in fieldnames}
+
+    for candidate in candidates:
+        if candidate in exact_map:
+            return exact_map[candidate]
+        lowered = candidate.lower()
+        if lowered in lower_map:
+            return lower_map[lowered]
+
+    # Fallback: if the sheet/list effectively has only one column, use it.
+    non_empty = [name for name in fieldnames if str(name).strip()]
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    raise ValueError(
+        f"無法判斷姓名欄位。可用欄位: {fieldnames}。請把欄位命名為 name 或 姓名。"
+    )
+
+
+def _read_csv_names(path: Path, name_column: str | None = None) -> set[str]:
+    names: set[str] = set()
+    tried_encodings = ["utf-8-sig", "cp950", "big5"]
+
+    for encoding in tried_encodings:
+        try:
+            with path.open("r", encoding=encoding, newline="") as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames:
+                    raise ValueError("CSV has no header row")
+
+                target_column = _resolve_name_column(list(reader.fieldnames), name_column)
+
+                for row in reader:
+                    value = (row.get(target_column) or "").strip()
+                    if value:
+                        names.add(value)
+                return names
+        except UnicodeDecodeError:
+            continue
+
+    raise UnicodeDecodeError(
+        "csv",
+        b"",
+        0,
+        1,
+        "Unable to decode CSV. Tried utf-8-sig, cp950, and big5.",
+    )
+
+
+def _read_xlsx_names(path: Path, name_column: str | None = None) -> set[str]:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Reading .xlsx requires openpyxl. Install it with: pip install openpyxl"
+        ) from exc
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+
+    rows = ws.iter_rows(values_only=True)
+    header = next(rows, None)
+    if not header:
+        return set()
+
+    header_text = [str(x).strip() if x is not None else "" for x in header]
+    non_empty_indexes = [i for i, v in enumerate(header_text) if v]
+    known_name_headers = {"name", "姓名", "個案姓名", "案主姓名"}
+
+    treat_first_row_as_data = False
+    if len(non_empty_indexes) == 1:
+        # Single-column sheet: if first row is not a known header, treat it as first name.
+        col_idx = non_empty_indexes[0]
+        first_text = header_text[col_idx]
+        if first_text.lower() not in {h.lower() for h in known_name_headers}:
+            treat_first_row_as_data = True
+    else:
+        target_col = _resolve_name_column(header_text, name_column)
+        col_idx = header_text.index(target_col)
+
+    names: set[str] = set()
+    if treat_first_row_as_data and col_idx < len(header):
+        first_value = header[col_idx]
+        if first_value is not None:
+            name = str(first_value).strip()
+            if name:
+                names.add(name)
+
+    for row in rows:
+        if col_idx >= len(row):
+            continue
+        val = row[col_idx]
+        if val is None:
+            continue
+        name = str(val).strip()
+        if name:
+            names.add(name)
+
+    wb.close()
+    return names
+
+
+def load_transfer_names(
+    path: Path,
+    name_column: str | None = None,
+    txt_encoding: str = "utf-8",
+) -> set[str]:
+    ext = path.suffix.lower()
+    if ext == ".txt":
+        return _read_txt_names(path, txt_encoding)
+    if ext == ".csv":
+        return _read_csv_names(path, name_column)
+    if ext in {".xlsx", ".xlsm"}:
+        return _read_xlsx_names(path, name_column)
+
+    raise ValueError("transfer-list only supports .txt, .csv, .xlsx, .xlsm")
+
+
+def _find_hits(page_text: str, transfer_names: Iterable[str]) -> list[str]:
+    hits: list[str] = []
+    normalized_page = _normalize_text(page_text)
+    for name in transfer_names:
+        if _normalize_text(name) in normalized_page:
+            hits.append(name)
+    return hits
+
+
+def _sanitize_windows_name(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]', "_", value).strip().rstrip(".")
+    return cleaned or "未命名個案"
+
+
+def _extract_case_name(page_text: str) -> str | None:
+    text = page_text or ""
+    patterns = [
+        r"姓\s*名\s*[:：]\s*([^\n\r]{1,30})",
+        r"戶\s*名\s*[:：]\s*([^\n\r]{1,30})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        raw = match.group(1)
+        # Keep Chinese/English letters while removing excessive separators/spaces.
+        name = "".join(ch for ch in raw if ch.isalnum() or ("\u4e00" <= ch <= "\u9fff"))
+        if name:
+            return name
+
+    # Fallback for this PDF template: no "姓名:" label in extracted text.
+    # Common layout is: period -> ID -> name -> name -> name -> amounts.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    id_pattern = re.compile(r"^[A-Z][0-9]{9}$")
+    amount_like = re.compile(r"^(NT\$|\d{1,3}(,\d{3})*|\d+)$")
+
+    for i, line in enumerate(lines):
+        if not id_pattern.fullmatch(line):
+            continue
+
+        # Look at a short window after ID and pick the first likely name line.
+        window = lines[i + 1 : i + 7]
+        for cand in window:
+            # Exclude obvious non-name lines.
+            if amount_like.match(cand):
+                continue
+            if re.fullmatch(r"\d{4}[-/]\d{2}", cand):
+                continue
+            if re.fullmatch(r"\d{4}/\d{1,2}/\d{1,2}", cand):
+                continue
+
+            # Keep only CJK letters for name.
+            cjk_name = "".join(ch for ch in cand if "\u4e00" <= ch <= "\u9fff")
+            if 2 <= len(cjk_name) <= 5:
+                return cjk_name
+
+    return None
+
+
+def split_filtered_pdf_by_case(filtered_pdf: Path, split_root_dir: Path) -> dict:
+    PdfReader, PdfWriter = _import_pdf_lib()
+    reader = PdfReader(str(filtered_pdf))
+
+    case_writers: dict[str, PdfWriter] = {}
+    case_display_name: dict[str, str] = {}
+    unidentified_pages = 0
+
+    for idx, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        case_name = _extract_case_name(page_text)
+
+        if not case_name:
+            case_name = f"未辨識個案_{idx:03d}"
+            unidentified_pages += 1
+
+        safe_name = _sanitize_windows_name(case_name)
+
+        writer = case_writers.get(safe_name)
+        if writer is None:
+            writer = PdfWriter()
+            case_writers[safe_name] = writer
+            case_display_name[safe_name] = case_name
+        writer.add_page(page)
+
+    split_root_dir.mkdir(parents=True, exist_ok=True)
+
+    output_files: list[str] = []
+    for safe_name, writer in case_writers.items():
+        case_dir = split_root_dir / safe_name
+        case_dir.mkdir(parents=True, exist_ok=True)
+        output_pdf = case_dir / f"{safe_name}.pdf"
+        with output_pdf.open("wb") as f:
+            writer.write(f)
+        output_files.append(str(output_pdf))
+
+    return {
+        "split_root": str(split_root_dir),
+        "case_count": len(case_writers),
+        "output_files": output_files,
+        "unidentified_pages": unidentified_pages,
+    }
+
+
+def filter_pdf(
+    input_pdf: Path,
+    output_pdf: Path,
+    transfer_names: set[str],
+    report_json: Path | None = None,
+) -> dict:
+    PdfReader, PdfWriter = _import_pdf_lib()
+
+    reader = PdfReader(str(input_pdf))
+    writer = PdfWriter()
+
+    removed_pages: list[dict] = []
+    kept_pages: list[int] = []
+    matched_transfer_names: set[str] = set()
+
+    for idx, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        matched_names = _find_hits(text, transfer_names)
+
+        if matched_names:
+            matched_transfer_names.update(matched_names)
+            removed_pages.append(
+                {
+                    "page": idx,
+                    "matched_names": sorted(set(matched_names)),
+                }
+            )
+            continue
+
+        writer.add_page(page)
+        kept_pages.append(idx)
+
+    unmatched_transfer_names = sorted(transfer_names - matched_transfer_names)
+
+    if len(kept_pages) == len(reader.pages):
+        # No hit found. Keep output deterministic by copying source file bytes.
+        shutil.copyfile(input_pdf, output_pdf)
+    else:
+        with output_pdf.open("wb") as f:
+            writer.write(f)
+
+    report = {
+        "input_pdf": str(input_pdf),
+        "output_pdf": str(output_pdf),
+        "total_pages": len(reader.pages),
+        "kept_pages": kept_pages,
+        "removed_pages": removed_pages,
+        "transfer_names_count": len(transfer_names),
+        "matched_transfer_names": sorted(matched_transfer_names),
+        "unmatched_transfer_names": unmatched_transfer_names,
+    }
+
+    if report_json:
+        import json
+
+        with report_json.open("w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+    return report
+
+
+def run_filter(
+    input_pdf_raw: str,
+    transfer_list_raw: str,
+    output_pdf_raw: str,
+    name_column: str | None = None,
+    txt_encoding: str = "utf-8",
+    report_json_raw: str = "",
+) -> tuple[dict, Path, Path | None]:
+    input_pdf = Path(input_pdf_raw).expanduser().resolve()
+    if not input_pdf.exists():
+        raise FileNotFoundError(f"Input PDF not found: {input_pdf}")
+
+    transfer_list = Path(transfer_list_raw).expanduser().resolve()
+    if not transfer_list.exists():
+        raise FileNotFoundError(f"Transfer list not found: {transfer_list}")
+
+    output_pdf = (
+        Path(output_pdf_raw).expanduser().resolve()
+        if output_pdf_raw.strip()
+        else input_pdf.with_name(f"{input_pdf.stem}_filtered.pdf")
+    )
+
+    report_json = (
+        Path(report_json_raw).expanduser().resolve()
+        if report_json_raw.strip()
+        else None
+    )
+
+    transfer_names = load_transfer_names(
+        transfer_list,
+        name_column=name_column,
+        txt_encoding=txt_encoding,
+    )
+    if not transfer_names:
+        raise ValueError("Transfer name list is empty")
+
+    report = filter_pdf(
+        input_pdf=input_pdf,
+        output_pdf=output_pdf,
+        transfer_names=transfer_names,
+        report_json=report_json,
+    )
+    return report, output_pdf, report_json
+
+
+def launch_ui() -> int:
+    root = tk.Tk()
+    root.title("超商繳費 PDF 排除轉帳個案")
+    root.geometry("860x500")
+    root.minsize(820, 460)
+    root.configure(bg="#f2f5f9")
+
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("App.TFrame", background="#f2f5f9")
+    style.configure("Card.TFrame", background="#ffffff", relief="flat")
+    style.configure("Title.TLabel", background="#f2f5f9", foreground="#183153", font=("Microsoft JhengHei UI", 17, "bold"))
+    style.configure("Subtitle.TLabel", background="#f2f5f9", foreground="#4a6078", font=("Microsoft JhengHei UI", 10))
+    style.configure("FieldTitle.TLabel", background="#ffffff", foreground="#233a56", font=("Microsoft JhengHei UI", 10, "bold"))
+    style.configure("FieldHint.TLabel", background="#ffffff", foreground="#7187a0", font=("Microsoft JhengHei UI", 9))
+    style.configure("Status.TLabel", background="#eef4ff", foreground="#16438b", font=("Microsoft JhengHei UI", 10))
+    style.configure("Accent.TButton", font=("Microsoft JhengHei UI", 10, "bold"))
+    style.configure("Tool.TButton", font=("Microsoft JhengHei UI", 9))
+
+    outer = ttk.Frame(root, style="App.TFrame", padding=(18, 14, 18, 14))
+    outer.pack(fill="both", expand=True)
+
+    header = ttk.Frame(outer, style="App.TFrame")
+    header.pack(fill="x", pady=(0, 10))
+    ttk.Label(header, text="超商繳費 PDF 篩選工具", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(
+        header,
+        text="依轉帳名單自動排除 PDF 個案頁面，並顯示未命中名單。",
+        style="Subtitle.TLabel",
+    ).pack(anchor="w", pady=(2, 0))
+
+    card = ttk.Frame(outer, style="Card.TFrame", padding=(16, 14, 16, 14))
+    card.pack(fill="both", expand=True)
+
+    input_pdf_var = tk.StringVar()
+    transfer_list_var = tk.StringVar()
+    output_pdf_var = tk.StringVar()
+    split_output_dir_var = tk.StringVar()
+    split_enabled_var = tk.BooleanVar(value=False)
+    status_var = tk.StringVar(value="請先選擇來源 PDF 與轉帳名單")
+
+    def choose_input_pdf() -> None:
+        path = filedialog.askopenfilename(
+            title="選擇超商繳費 PDF",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        input_pdf_var.set(path)
+        src = Path(path)
+        output_pdf_var.set(str(src.with_name(f"{src.stem}_filtered.pdf")))
+
+    def choose_transfer_list() -> None:
+        path = filedialog.askopenfilename(
+            title="選擇轉帳個案名單",
+            filetypes=[
+                ("Excel files", "*.xlsx;*.xlsm"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            transfer_list_var.set(path)
+
+    def choose_output_pdf() -> None:
+        path = filedialog.asksaveasfilename(
+            title="輸出 PDF",
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if path:
+            output_pdf_var.set(path)
+
+    def choose_split_output_dir() -> None:
+        path = filedialog.askdirectory(title="選擇分案輸出資料夾")
+        if path:
+            split_output_dir_var.set(path)
+
+    def set_running_state(running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for btn in (btn_input, btn_list, btn_out, btn_split_dir, btn_run):
+            btn.configure(state=state)
+        chk_split.configure(state=state)
+
+    def show_unmatched_window(unmatched_names: list[str]) -> None:
+        win = tk.Toplevel(root)
+        win.title("未命中名單")
+        win.geometry("470x440")
+        win.configure(bg="#f4f7fc")
+
+        box = ttk.Frame(win, style="App.TFrame", padding=(14, 12, 14, 12))
+        box.pack(fill="both", expand=True)
+
+        if unmatched_names:
+            ttk.Label(
+                box,
+                text=f"以下 {len(unmatched_names)} 位在轉帳名單中，但未出現在本次 PDF：",
+                style="Subtitle.TLabel",
+                justify="left",
+            ).pack(fill="x", pady=(0, 8), anchor="w")
+        else:
+            ttk.Label(
+                box,
+                text="本次轉帳名單全部命中 PDF，沒有未命中個案。",
+                style="Subtitle.TLabel",
+                justify="left",
+            ).pack(fill="x", pady=(0, 8), anchor="w")
+
+        text = tk.Text(
+            box,
+            height=16,
+            width=44,
+            font=("Microsoft JhengHei UI", 10),
+            bg="#ffffff",
+            fg="#1f2f45",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=8,
+        )
+        scroll = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+
+        text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        if unmatched_names:
+            text.insert("1.0", "\n".join(unmatched_names))
+        else:
+            text.insert("1.0", "(無)")
+        text.configure(state="disabled")
+
+    def run_worker() -> None:
+        try:
+            report, output_pdf, report_json = run_filter(
+                input_pdf_raw=input_pdf_var.get(),
+                transfer_list_raw=transfer_list_var.get(),
+                output_pdf_raw=output_pdf_var.get(),
+            )
+        except Exception as exc:
+            err_msg = str(exc)
+
+            def on_error() -> None:
+                set_running_state(False)
+                status_var.set("處理失敗，請檢查輸入與檔案格式")
+                messagebox.showerror("執行失敗", err_msg)
+
+            root.after(0, on_error)
+            return
+
+        def on_done() -> None:
+            set_running_state(False)
+            removed_count = len(report["removed_pages"])
+            unmatched_names = report.get("unmatched_transfer_names", [])
+            split_msg = ""
+
+            if split_enabled_var.get():
+                split_dir = split_output_dir_var.get().strip()
+                if not split_dir:
+                    chosen = filedialog.askdirectory(title="選擇分案輸出資料夾")
+                    if chosen:
+                        split_dir = chosen
+                        split_output_dir_var.set(chosen)
+
+                if split_dir:
+                    try:
+                        split_result = split_filtered_pdf_by_case(
+                            filtered_pdf=output_pdf,
+                            split_root_dir=Path(split_dir),
+                        )
+                        split_msg = (
+                            f"\n分案輸出: {split_result['case_count']} 位"
+                            f"\n分案位置: {split_result['split_root']}"
+                        )
+                        if split_result["unidentified_pages"]:
+                            split_msg += f"\n未辨識姓名頁數: {split_result['unidentified_pages']}"
+                    except Exception as split_exc:
+                        messagebox.showerror("分案輸出失敗", str(split_exc))
+                        split_msg = "\n分案輸出: 失敗"
+                else:
+                    split_msg = "\n分案輸出: 已略過（未選擇資料夾）"
+
+            status_var.set(
+                f"完成：保留 {len(report['kept_pages'])}/{report['total_pages']} 頁，排除 {removed_count} 頁，未命中 {len(unmatched_names)} 位"
+            )
+            messagebox.showinfo(
+                "執行完成",
+                "PDF 已完成過濾\n"
+                f"輸出 PDF:\n{output_pdf}\n\n"
+                f"總頁數: {report['total_pages']}\n"
+                f"保留頁數: {len(report['kept_pages'])}\n"
+                f"排除頁數: {removed_count}\n"
+                f"未命中人數: {len(unmatched_names)}"
+                f"{split_msg}",
+            )
+            show_unmatched_window(unmatched_names)
+
+        root.after(0, on_done)
+
+    def run_clicked() -> None:
+        if not input_pdf_var.get().strip():
+            messagebox.showwarning("欄位不足", "請先選擇來源 PDF")
+            return
+        if not transfer_list_var.get().strip():
+            messagebox.showwarning("欄位不足", "請先選擇轉帳名單")
+            return
+
+        set_running_state(True)
+        status_var.set("處理中，正在讀取 PDF 並比對轉帳名單，請稍候...")
+        t = threading.Thread(target=run_worker, daemon=True)
+        t.start()
+
+    form = ttk.Frame(card, style="Card.TFrame")
+    form.pack(fill="both", expand=True)
+
+    def build_row(row: int, title: str, hint: str, variable: tk.StringVar, button_text: str, action):
+        ttk.Label(form, text=title, style="FieldTitle.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=(10, 2))
+        ttk.Entry(form, textvariable=variable, font=("Microsoft JhengHei UI", 10)).grid(
+            row=row, column=1, sticky="we", pady=(10, 2)
+        )
+        button = ttk.Button(form, text=button_text, style="Tool.TButton", command=action)
+        button.grid(row=row, column=2, sticky="e", padx=(10, 0), pady=(10, 2))
+        ttk.Label(form, text=hint, style="FieldHint.TLabel").grid(
+            row=row + 1, column=1, sticky="w", pady=(0, 4)
+        )
+        return button
+
+    btn_input = build_row(
+        row=0,
+        title="來源 PDF",
+        hint="請選擇本期超商繳費 PDF。",
+        variable=input_pdf_var,
+        button_text="瀏覽",
+        action=choose_input_pdf,
+    )
+    btn_list = build_row(
+        row=2,
+        title="轉帳名單",
+        hint="支援 Excel 格式（xlsx / xlsm）。",
+        variable=transfer_list_var,
+        button_text="瀏覽",
+        action=choose_transfer_list,
+    )
+    btn_out = build_row(
+        row=4,
+        title="輸出 PDF",
+        hint="未填時會自動使用原檔名加上 _filtered。",
+        variable=output_pdf_var,
+        button_text="另存",
+        action=choose_output_pdf,
+    )
+
+    chk_split = ttk.Checkbutton(
+        form,
+        text="篩選後分案輸出（每位個案一份 PDF）",
+        variable=split_enabled_var,
+    )
+    chk_split.grid(row=6, column=1, sticky="w", pady=(10, 2))
+
+    btn_split_dir = build_row(
+        row=7,
+        title="分案資料夾",
+        hint="勾選分案輸出時使用；未填會在完成後詢問。",
+        variable=split_output_dir_var,
+        button_text="瀏覽",
+        action=choose_split_output_dir,
+    )
+
+    action_bar = ttk.Frame(form, style="Card.TFrame")
+    action_bar.grid(row=9, column=0, columnspan=3, sticky="we", pady=(14, 4))
+    btn_run = ttk.Button(action_bar, text="開始排除轉帳個案", style="Accent.TButton", command=run_clicked)
+    btn_run.pack(side="left")
+
+    status_box = ttk.Frame(form, style="Card.TFrame")
+    status_box.grid(row=10, column=0, columnspan=3, sticky="we", pady=(12, 0))
+    tk.Label(
+        status_box,
+        textvariable=status_var,
+        bg="#eef4ff",
+        fg="#16438b",
+        font=("Microsoft JhengHei UI", 10),
+        anchor="w",
+        justify="left",
+        padx=10,
+        pady=10,
+        relief="solid",
+        borderwidth=1,
+    ).pack(fill="x")
+
+    form.columnconfigure(1, weight=1)
+    root.mainloop()
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Filter transfer-case pages out of a payment PDF by case-name list."
+    )
+    parser.add_argument("--input-pdf", default="", help="Source PDF path")
+    parser.add_argument(
+        "--transfer-list",
+        default="",
+        help="Transfer case list (.xlsx/.xlsm preferred)",
+    )
+    parser.add_argument(
+        "--name-column",
+        default="name",
+        help="Name column for csv/xlsx. Default: name",
+    )
+    parser.add_argument(
+        "--txt-encoding",
+        default="utf-8",
+        help="Encoding for txt list. Default: utf-8",
+    )
+    parser.add_argument(
+        "--output-pdf",
+        default="",
+        help="Output PDF path. Default: <input_stem>_filtered.pdf",
+    )
+    parser.add_argument(
+        "--report-json",
+        default="",
+        help="Optional JSON report path",
+    )
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Launch desktop UI mode",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    # Launch UI when explicitly requested or when no CLI file args are provided.
+    if args.ui or (not args.input_pdf and not args.transfer_list):
+        return launch_ui()
+
+    if not args.input_pdf or not args.transfer_list:
+        raise ValueError("CLI mode requires --input-pdf and --transfer-list")
+
+    report, output_pdf, report_json = run_filter(
+        input_pdf_raw=args.input_pdf,
+        transfer_list_raw=args.transfer_list,
+        output_pdf_raw=args.output_pdf,
+        name_column=args.name_column,
+        txt_encoding=args.txt_encoding,
+        report_json_raw=args.report_json,
+    )
+
+    print(f"Done. Output PDF: {output_pdf}")
+    if report_json:
+        print(f"Report JSON: {report_json}")
+    print(
+        f"Pages kept: {len(report['kept_pages'])} / {report['total_pages']}; "
+        f"Pages removed: {len(report['removed_pages'])}"
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
